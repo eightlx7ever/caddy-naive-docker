@@ -1,8 +1,21 @@
 
-name: Build Caddy Naive Docker
+name: Build Caddy NaiveProxy Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      promote_latest:
+        description: "Promote this version to latest"
+        required: true
+        type: boolean
+        default: false
+
+      force_rebuild:
+        description: "Force rebuild even if version tag exists"
+        required: true
+        type: boolean
+        default: false
+
   schedule:
     - cron: "0 */6 * * *"
 
@@ -10,6 +23,7 @@ permissions:
   contents: read
   packages: write
 
+# 避免多个相同工作流同时运行
 concurrency:
   group: caddy-naive-build
   cancel-in-progress: false
@@ -19,99 +33,95 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+
+      # ==========================================
+      # 1. Checkout
+      # ==========================================
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get latest official release
-        id: release
+
+      # ==========================================
+      # 2. Get latest Caddy version
+      # ==========================================
+
+      - name: Get latest Caddy version
+        id: caddy
         shell: bash
         run: |
           set -euo pipefail
 
-          API="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
+          VERSION=$(curl -fsSL \
+            https://api.github.com/repos/caddyserver/caddy/releases/latest \
+            | jq -r '.tag_name')
 
-          RELEASE=$(curl -fsSL "$API")
+          VERSION="${VERSION#v}"
 
-          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
-
-          ASSET=$(echo "$RELEASE" | jq -r \
-            '.assets[] |
-            select(.name == "caddy-forwardproxy-naive.tar.xz") |
-            .browser_download_url')
-
-          DIGEST=$(echo "$RELEASE" | jq -r \
-            '.assets[] |
-            select(.name == "caddy-forwardproxy-naive.tar.xz") |
-            .digest')
-
-          if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-            echo "Release tag not found"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid Caddy version: $VERSION"
             exit 1
           fi
 
-          if [[ -z "$ASSET" || "$ASSET" == "null" ]]; then
-            echo "Official Caddy binary not found"
-            exit 1
-          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          if [[ -z "$DIGEST" || "$DIGEST" == "null" ]]; then
-            echo "SHA256 digest unavailable, refusing unverified binary"
-            exit 1
-          fi
+          echo "Caddy version: $VERSION"
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      - name: Download official Caddy binary
+      # ==========================================
+      # 3. Get forwardproxy naive commit
+      # ==========================================
+
+      - name: Get forwardproxy commit
+        id: forwardproxy
         shell: bash
-        env:
-          ASSET: ${{ steps.release.outputs.asset }}
-          DIGEST: ${{ steps.release.outputs.digest }}
         run: |
           set -euo pipefail
 
-          curl -fL "$ASSET" -o caddy.tar.xz
+          COMMIT=$(git ls-remote \
+            https://github.com/klzgrad/forwardproxy.git \
+            refs/heads/naive | awk '{print $1}')
 
-          EXPECTED="${DIGEST#sha256:}"
-
-          echo "$EXPECTED  caddy.tar.xz" | sha256sum -c -
-
-          mkdir -p extracted
-
-          tar -xJf caddy.tar.xz -C extracted
-
-          CADDY=$(find extracted -type f -name caddy | head -n 1)
-
-          if [[ -z "$CADDY" ]]; then
-            echo "Caddy binary not found"
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid forwardproxy commit"
             exit 1
           fi
 
-          cp "$CADDY" ./caddy
-          chmod 755 ./caddy
+          SHORT_COMMIT="${COMMIT:0:12}"
 
-          file ./caddy
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT_COMMIT" >> "$GITHUB_OUTPUT"
 
-          if ! file ./caddy | grep -q "x86-64"; then
-            echo "This workflow currently supports linux/amd64 only"
-            exit 1
-          fi
+          echo "forwardproxy commit: $COMMIT"
 
-          ./caddy version
 
-          ./caddy list-modules |
-            grep -Fx "http.handlers.forward_proxy"
+      # ==========================================
+      # 4. Set image name and version tag
+      # ==========================================
 
       - name: Set image name
         id: image
         shell: bash
         run: |
-          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/caddy-naive" \
-            >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" \
+            | tr '[:upper:]' '[:lower:]')
+
+          IMAGE="ghcr.io/${OWNER}/caddy-naive"
+
+          VERSION_TAG="caddy-${{ steps.caddy.outputs.version }}-fp-${{ steps.forwardproxy.outputs.short }}"
+
+          echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Image: $IMAGE"
+          echo "Version tag: $VERSION_TAG"
+
+
+      # ==========================================
+      # 5. Login GHCR before checking tag
+      # ==========================================
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -120,15 +130,139 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+
+      # ==========================================
+      # 6. Check whether version already exists
+      # ==========================================
+
+      - name: Check existing image
+        id: check
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION_TAG: ${{ steps.image.outputs.version_tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Force rebuild enabled."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Checking GHCR:"
+          echo "${IMAGE}:${VERSION_TAG}"
+
+          if docker manifest inspect \
+            "${IMAGE}:${VERSION_TAG}" >/dev/null 2>&1; then
+
+            echo "Image already exists."
+            echo "Skipping build."
+
+            echo "build=false" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "Image does not exist."
+            echo "Build required."
+
+            echo "build=true" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # ==========================================
+      # 7. Setup QEMU
+      # ==========================================
+
+      - name: Set up QEMU
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+
+      # ==========================================
+      # 8. Setup Buildx
+      # ==========================================
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+
+      # ==========================================
+      # 9. Build and test AMD64
+      # ==========================================
+
+      - name: Build and test AMD64 image
+        if: steps.check.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --pull \
+            --platform linux/amd64 \
+            --load \
+            --build-arg CADDY_VERSION=${{ steps.caddy.outputs.version }} \
+            --build-arg FORWARDPROXY_COMMIT=${{ steps.forwardproxy.outputs.commit }} \
+            -t caddy-naive:test \
+            .
+
+          echo "Checking Caddy version..."
+
+          docker run --rm caddy-naive:test version
+
+          echo "Checking forward_proxy module..."
+
+          docker run --rm caddy-naive:test list-modules \
+            | grep -Fx "http.handlers.forward_proxy"
+
+
+      # ==========================================
+      # 10. Build and push multi-platform image
+      # ==========================================
+
+      - name: Build and push image
+        if: steps.check.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          pull: true
+          platforms: linux/amd64,linux/arm64
           push: true
+
+          build-args: |
+            CADDY_VERSION=${{ steps.caddy.outputs.version }}
+            FORWARDPROXY_COMMIT=${{ steps.forwardproxy.outputs.commit }}
+
           tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag }}
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version_tag }}
+
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+            org.opencontainers.image.description=Caddy with klzgrad forwardproxy naive fork
+            org.opencontainers.image.version=${{ steps.caddy.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.forwardproxy.outputs.commit }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+      # ==========================================
+      # 11. Promote to latest (manual approval)
+      # ==========================================
+
+      - name: Promote image to latest
+        if: github.event_name == 'workflow_dispatch' && inputs.promote_latest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION_TAG: ${{ steps.image.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION_TAG}"
+
+          echo "Promoted ${VERSION_TAG} to latest."
