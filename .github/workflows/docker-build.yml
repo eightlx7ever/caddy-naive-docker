@@ -1,21 +1,8 @@
 
-name: Build Caddy NaiveProxy Docker Image
+name: Build Caddy Naive Docker
 
 on:
   workflow_dispatch:
-    inputs:
-      promote_latest:
-        description: "Promote this version to latest"
-        required: true
-        type: boolean
-        default: false
-
-      force_rebuild:
-        description: "Force rebuild even if version tag exists"
-        required: true
-        type: boolean
-        default: false
-
   schedule:
     - cron: "0 */6 * * *"
 
@@ -23,7 +10,6 @@ permissions:
   contents: read
   packages: write
 
-# 避免多个相同工作流同时运行
 concurrency:
   group: caddy-naive-build
   cancel-in-progress: false
@@ -33,96 +19,83 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # ==========================================
+      # -----------------------------------------------
       # 1. Checkout
-      # ==========================================
-
-      - name: Checkout repository
+      # -----------------------------------------------
+      - name: Checkout
         uses: actions/checkout@v4
 
-
-      # ==========================================
-      # 2. Get latest Caddy version
-      # ==========================================
-
-      - name: Get latest Caddy version
-        id: caddy
+      # -----------------------------------------------
+      # 2. 获取 forwardproxy 最新 Release
+      # -----------------------------------------------
+      - name: Get latest official release
+        id: release
         shell: bash
         run: |
           set -euo pipefail
 
-          VERSION=$(curl -fsSL \
-            https://api.github.com/repos/caddyserver/caddy/releases/latest \
-            | jq -r '.tag_name')
+          API="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
 
-          VERSION="${VERSION#v}"
+          RELEASE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "$API")
 
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid Caddy version: $VERSION"
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name // empty')
+
+          ASSET=$(echo "$RELEASE" | jq -r \
+            '.assets[] |
+             select(.name == "caddy-forwardproxy-naive.tar.xz") |
+             .browser_download_url' | head -n 1)
+
+          DIGEST=$(echo "$RELEASE" | jq -r \
+            '.assets[] |
+             select(.name == "caddy-forwardproxy-naive.tar.xz") |
+             .digest' | head -n 1)
+
+          if [[ -z "$TAG" ]]; then
+            echo "Release tag not found"
             exit 1
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          echo "Caddy version: $VERSION"
-
-
-      # ==========================================
-      # 3. Get forwardproxy naive commit
-      # ==========================================
-
-      - name: Get forwardproxy commit
-        id: forwardproxy
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          COMMIT=$(git ls-remote \
-            https://github.com/klzgrad/forwardproxy.git \
-            refs/heads/naive | awk '{print $1}')
-
-          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Invalid forwardproxy commit"
+          if [[ -z "$ASSET" || "$ASSET" == "null" ]]; then
+            echo "Official Caddy binary not found"
             exit 1
           fi
 
-          SHORT_COMMIT="${COMMIT:0:12}"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "Valid SHA256 digest unavailable"
+            echo "Refusing to download an unverified binary"
+            exit 1
+          fi
 
-          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "short=$SHORT_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Official Release: $TAG"
+          echo "Asset: $ASSET"
+          echo "Digest: $DIGEST"
 
-          echo "forwardproxy commit: $COMMIT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-
-      # ==========================================
-      # 4. Set image name and version tag
-      # ==========================================
-
+      # -----------------------------------------------
+      # 3. 设置 GHCR 镜像名称
+      # -----------------------------------------------
       - name: Set image name
         id: image
         shell: bash
         run: |
-          set -euo pipefail
-
-          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" \
-            | tr '[:upper:]' '[:lower:]')
-
-          IMAGE="ghcr.io/${OWNER}/caddy-naive"
-
-          VERSION_TAG="caddy-${{ steps.caddy.outputs.version }}-fp-${{ steps.forwardproxy.outputs.short }}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/caddy-naive"
 
           echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
 
-          echo "Image: $IMAGE"
-          echo "Version tag: $VERSION_TAG"
+      # -----------------------------------------------
+      # 4. 设置 Docker Buildx
+      # -----------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-
-      # ==========================================
-      # 5. Login GHCR before checking tag
-      # ==========================================
-
+      # -----------------------------------------------
+      # 5. 登录 GHCR
+      # -----------------------------------------------
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -130,139 +103,171 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-
-      # ==========================================
-      # 6. Check whether version already exists
-      # ==========================================
-
-      - name: Check existing image
+      # -----------------------------------------------
+      # 6. 检查 GHCR 是否已经存在该版本
+      # -----------------------------------------------
+      - name: Check whether version image already exists
         id: check
         shell: bash
         env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          VERSION_TAG: ${{ steps.image.outputs.version_tag }}
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE_NAME: caddy-naive
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
 
-          if [[ "$FORCE_REBUILD" == "true" ]]; then
-            echo "Force rebuild enabled."
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          OWNER="${OWNER,,}"
 
-          echo "Checking GHCR:"
-          echo "${IMAGE}:${VERSION_TAG}"
-
-          if docker manifest inspect \
-            "${IMAGE}:${VERSION_TAG}" >/dev/null 2>&1; then
-
-            echo "Image already exists."
-            echo "Skipping build."
-
-            echo "build=false" >> "$GITHUB_OUTPUT"
-
+          if [[ "$OWNER_TYPE" == "Organization" ]]; then
+            API="https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
           else
-
-            echo "Image does not exist."
-            echo "Build required."
-
-            echo "build=true" >> "$GITHUB_OUTPUT"
-
+            API="https://api.github.com/users/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
           fi
 
+          PAGE=1
+          FOUND=false
 
-      # ==========================================
-      # 7. Setup QEMU
-      # ==========================================
+          while true; do
+            URL="${API}?per_page=100&page=${PAGE}"
 
-      - name: Set up QEMU
-        if: steps.check.outputs.build == 'true'
-        uses: docker/setup-qemu-action@v3
+            HTTP_CODE=$(curl -sS \
+              --retry 3 \
+              --retry-delay 2 \
+              -o versions.json \
+              -w "%{http_code}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$URL")
 
+            # 包尚未创建：首次构建
+            if [[ "$HTTP_CODE" == "404" && "$PAGE" == "1" ]]; then
+              echo "GHCR package does not exist yet."
+              break
+            fi
 
-      # ==========================================
-      # 8. Setup Buildx
-      # ==========================================
+            # 其他非 200 状态不能当成版本不存在
+            if [[ "$HTTP_CODE" != "200" ]]; then
+              echo "Failed to query GHCR package versions."
+              echo "HTTP status: $HTTP_CODE"
+              cat versions.json
+              exit 1
+            fi
 
-      - name: Set up Docker Buildx
-        if: steps.check.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+            # 检查当前页面中的所有镜像标签
+            if jq -e --arg TAG "$TAG" \
+              '[.[].metadata.container.tags[]?] | index($TAG) != null' \
+              versions.json >/dev/null; then
 
+              FOUND=true
+              break
+            fi
 
-      # ==========================================
-      # 9. Build and test AMD64
-      # ==========================================
+            COUNT=$(jq 'length' versions.json)
 
-      - name: Build and test AMD64 image
-        if: steps.check.outputs.build == 'true'
+            # 不足 100 条，说明已经到最后一页
+            if [[ "$COUNT" -lt 100 ]]; then
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+          done
+
+          if [[ "$FOUND" == "true" ]]; then
+            echo "Version already exists: $TAG"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version does not exist: $TAG"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------
+      # 7. 下载官方 Caddy-Naive 二进制
+      #    只有版本不存在时才执行
+      # -----------------------------------------------
+      - name: Download official Caddy binary
+        if: steps.check.outputs.exists != 'true'
         shell: bash
+        env:
+          ASSET: ${{ steps.release.outputs.asset }}
+          DIGEST: ${{ steps.release.outputs.digest }}
         run: |
           set -euo pipefail
 
-          docker buildx build \
-            --pull \
-            --platform linux/amd64 \
-            --load \
-            --build-arg CADDY_VERSION=${{ steps.caddy.outputs.version }} \
-            --build-arg FORWARDPROXY_COMMIT=${{ steps.forwardproxy.outputs.commit }} \
-            -t caddy-naive:test \
-            .
+          curl -fL --retry 3 \
+            "$ASSET" \
+            -o caddy.tar.xz
 
-          echo "Checking Caddy version..."
+          EXPECTED="${DIGEST#sha256:}"
 
-          docker run --rm caddy-naive:test version
+          echo "$EXPECTED  caddy.tar.xz" | sha256sum -c -
 
-          echo "Checking forward_proxy module..."
+          mkdir -p extracted
 
-          docker run --rm caddy-naive:test list-modules \
-            | grep -Fx "http.handlers.forward_proxy"
+          tar -xJf caddy.tar.xz -C extracted
 
+          CADDY=$(find extracted -type f -name caddy -print -quit)
 
-      # ==========================================
-      # 10. Build and push multi-platform image
-      # ==========================================
+          if [[ -z "$CADDY" ]]; then
+            echo "Caddy binary not found in archive"
+            exit 1
+          fi
 
-      - name: Build and push image
-        if: steps.check.outputs.build == 'true'
+          cp "$CADDY" ./caddy
+          chmod 755 ./caddy
+
+          # 检查二进制架构
+          file ./caddy
+
+          if ! file ./caddy | grep -q "x86-64"; then
+            echo "Unsupported architecture"
+            echo "This workflow currently supports linux/amd64 only"
+            exit 1
+          fi
+
+          # 检查 Caddy 版本
+          ./caddy version
+
+          # 检查 forwardproxy 插件
+          ./caddy list-modules |
+            grep -Fx "http.handlers.forward_proxy"
+
+      # -----------------------------------------------
+      # 8. 构建并推送 GHCR
+      #    只有版本不存在时才执行
+      # -----------------------------------------------
+      - name: Build and push
+        if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          pull: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-
-          build-args: |
-            CADDY_VERSION=${{ steps.caddy.outputs.version }}
-            FORWARDPROXY_COMMIT=${{ steps.forwardproxy.outputs.commit }}
-
           tags: |
-            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version_tag }}
-
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ steps.release.outputs.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Caddy with klzgrad forwardproxy naive fork
-            org.opencontainers.image.version=${{ steps.caddy.outputs.version }}
-            org.opencontainers.image.revision=${{ steps.forwardproxy.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
 
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-
-      # ==========================================
-      # 11. Promote to latest (manual approval)
-      # ==========================================
-
-      - name: Promote image to latest
-        if: github.event_name == 'workflow_dispatch' && inputs.promote_latest
+      # -----------------------------------------------
+      # 9. 输出结果
+      # -----------------------------------------------
+      - name: Summary
+        shell: bash
         env:
+          TAG: ${{ steps.release.outputs.tag }}
+          EXISTS: ${{ steps.check.outputs.exists }}
           IMAGE: ${{ steps.image.outputs.name }}
-          VERSION_TAG: ${{ steps.image.outputs.version_tag }}
         run: |
-          set -euo pipefail
-
-          docker buildx imagetools create \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}:${VERSION_TAG}"
-
-          echo "Promoted ${VERSION_TAG} to latest."
+          if [[ "$EXISTS" == "true" ]]; then
+            echo "## Build skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Version $TAG already exists in GHCR." >> "$GITHUB_STEP_SUMMARY"
+            echo "No download or build was performed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Build successful" >> "$GITHUB_STEP_SUMMARY"
+            echo "Published: $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+            echo "Published: $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+          fi
